@@ -164,7 +164,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	cmd.Stderr = newLogWriter(b.cfg.Logger, "[opencode:stderr] ")
 
-	if err := cmd.Start(); err != nil {
+	if err := startProcessGroup(cmd); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start opencode: %w", err)
 	}
@@ -182,12 +182,13 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	// it spawned) BEFORE unblocking the scanner. The previous implementation
 	// closed the stdout read end immediately, which left opencode writing into
 	// a closed pipe: every write returns EPIPE and, per anomalyco/opencode#33653,
-	// can spin the orphaned process at 100% CPU. Instead we SIGTERM the whole
+	// can spin the orphaned process at 100% CPU. On Unix we SIGTERM the whole
 	// process group, give it a grace period to exit cleanly, then SIGKILL it.
-	// SIGKILL is uncatchable, so once it is delivered no group member can run
-	// (or write) again — only then is it safe to close the stdout read end as a
-	// last-resort unblock for a scanner that a wedged descendant still keeps
-	// open. WaitDelay is the final backstop (#4533).
+	// On Windows, signalProcessGroup closes the kill-on-close Job Object on
+	// the first call, so cancellation immediately terminates the process tree;
+	// the grace window is a no-op there. Only after tree termination do we close
+	// the stdout read end as a last-resort unblock for a scanner that a wedged
+	// descendant still keeps open. WaitDelay is the final backstop (#4533).
 	go func() {
 		select {
 		case <-procDone:
@@ -215,6 +216,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 		// Wait for process exit, then release the cancellation handler.
 		exitErr := cmd.Wait()
+		releaseProcessGroup(cmd.Process)
 		close(procDone)
 		duration := time.Since(startTime)
 
