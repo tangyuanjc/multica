@@ -54,12 +54,13 @@ An issue is admitted when any of these conditions is true:
 3. Its description contains one or more valid, completed hr37 blocks.
 
 The whitelist is code, not configuration. A leading bracketed category is
-exempt only when that category contains one of the fixed daily/patrol/
-announcement markers: `日报`, `daily`, `巡检`, `日检`, `周检`, `patrol`, `公告`,
-or `announcement`. The known unbracketed automated prefix
-`🔍 Multica daily 扫描` is also explicit. Matching only the leading category
-prevents an engineering title such as `[P1] 修复日报生成器` from bypassing the
-gate merely because later prose mentions a daily report.
+exempt only when its normalized text exactly equals one catalog entry:
+`daily`, `work-daily`, `日报`, `工作日报`, `日报状态票`, `日报可见性`,
+`loop radar daily`, `天猫投放监控日报`, `巡检`, `日检`, `周检`, `patrol`,
+`公告`, or `announcement`. The known unbracketed automated prefix
+`🔍 Multica daily 扫描` is also explicit and ASCII-case-insensitive. Exact
+category matching prevents near-matches such as `[announcement-fix]` and an
+engineering title such as `[P1] 修复日报生成器` from bypassing the gate.
 
 Everything else is an engineering issue and must carry assertions.
 
@@ -92,16 +93,21 @@ issue.
 ### Single update
 
 `UpdateIssue` computes the prospective title and description from the current
-row plus any fields changed in the request. When the status changes from a
-non-review value to `in_review`, the guard runs before the sqlc update. A failure
-returns HTTP 400 and leaves the row unchanged.
+row plus any fields changed in the request. Every request explicitly targeting
+`in_review` locks and reloads the row in a transaction; when that locked status
+is non-review, the guard runs before the sqlc update in the same transaction. A
+failure returns HTTP 400 and leaves the row unchanged. This closes stale-request
+races while preserving redundant updates to rows already in review.
 
 ### Batch update
 
-`BatchUpdateIssues` preflights every resolvable in-scope issue before applying
-any update to `in_review`. One violation rejects the entire batch before the
-first mutation, avoiding a half-admitted result. Invalid, unknown, or
-cross-workspace IDs preserve the existing skip behavior.
+`BatchUpdateIssues` canonicalizes and deduplicates valid target IDs for locking,
+locks them in deterministic UUID order in one transaction, and preflights every
+resolvable in-scope locked row before applying any update to `in_review`. One
+violation rejects the entire batch before the first mutation. Accepted writes
+commit atomically, and events, task dispatch, and parent notification happen
+only after commit. Invalid, unknown, or cross-workspace IDs preserve the
+existing skip behavior; duplicate IDs retain request-order/count semantics.
 
 All rejections include the issue identifier when available, the word `断言块`,
 and a remediation hint naming the required fields.

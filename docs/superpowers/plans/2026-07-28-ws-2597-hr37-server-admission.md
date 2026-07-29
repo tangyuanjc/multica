@@ -4,7 +4,7 @@
 
 **Goal:** Reject every new, non-exempt engineering issue's first transition into `in_review` unless it contains a valid, completed hr37 assertion block.
 
-**Architecture:** A pure `server/internal/issueguard` parser and admission policy owns the confirmed hr37 schema, rollout cutoff, and hardcoded exemption list. Create, single-update, and batch-update handlers call the policy before writing; batch updates use a read-only preflight so a violation cannot produce partial mutations.
+**Architecture:** A pure `server/internal/issueguard` parser and admission policy owns the confirmed hr37 schema, rollout cutoff, and hardcoded exemption list. Create, single-update, and batch-update handlers call the policy before writing; update paths lock and reload targeted rows so admission and mutation share one transactional snapshot.
 
 **Tech Stack:** Go 1.26, Chi HTTP handlers, pgx/sqlc models, standard-library JSON parsing, PostgreSQL-backed handler tests.
 
@@ -169,8 +169,8 @@ type ReviewAssertionAdmissionResult struct {
 ```
 
 Add reasons for allowed, grandfathered, exempt, missing, invalid, and blank
-observed outcomes. Use a fixed list of leading bracket markers plus the exact
-unbracketed prefix `🔍 Multica daily 扫描`. Every rejection message contains
+observed outcomes. Use exact normalized leading-category matches from the fixed
+catalog plus the unbracketed prefix `🔍 Multica daily 扫描`. Every rejection message contains
 `断言块` without echoing an `evidence_cmd`.
 
 - [ ] **Step 4: Verify parser and policy GREEN**
@@ -215,8 +215,8 @@ Expected: missing-block requests incorrectly return 200/201.
 ```go
 func (h *Handler) admitExistingIssueToReview(
 	w http.ResponseWriter,
-	r *http.Request,
 	issue db.Issue,
+	identifier string,
 	title string,
 	description string,
 ) bool
@@ -224,15 +224,16 @@ func (h *Handler) admitExistingIssueToReview(
 func admitNewIssueToReview(w http.ResponseWriter, title string, description string) bool
 ```
 
-The existing-issue helper derives the workspace identifier and created time.
-Both call `issueguard.CheckReviewAssertionAdmission` and use `writeError` on
-rejection.
+The caller resolves the identifier before opening a guarded transaction; the
+helper supplies the row's created time. Both call
+`issueguard.CheckReviewAssertionAdmission` and use `writeError` on rejection.
 
 - [ ] **Step 4: Wire both handlers before mutation**
 
 In `CreateIssue`, guard initial `in_review` after enum validation. In
-`UpdateIssue`, compute prospective title/description and guard only when the
-current status is not `in_review` and the requested status is `in_review`.
+`UpdateIssue`, every request targeting `in_review` locks and reloads the row;
+compute prospective title/description and guard when the locked current status
+is not `in_review`.
 
 - [ ] **Step 5: Verify GREEN with the Step 2 command**
 
@@ -243,7 +244,7 @@ git add server/internal/handler/issue.go server/internal/handler/issue_review_as
 git commit -m "feat(issues): gate review transitions on hr37 evidence (WS-2597)"
 ```
 
-### Task 4: Batch preflight without partial writes
+### Task 4: Atomic batch preflight without partial writes
 
 **Files:**
 - Modify: `server/internal/handler/issue_review_assertion_admission.go`
@@ -259,22 +260,19 @@ Assert HTTP 400 contains `断言块` and both database rows remain `todo`.
 
 Run the handler package with `-run TestReviewAssertionAdmissionBatchPreflight`.
 
-- [ ] **Step 3: Implement read-only preflight**
+- [ ] **Step 3: Implement locked transactional preflight**
 
 ```go
-func (h *Handler) preflightBatchReviewAssertionAdmission(
-	w http.ResponseWriter,
-	r *http.Request,
-	workspaceID pgtype.UUID,
-	issueIDs []string,
-	updates UpdateIssueRequest,
-) bool
+func sortedUniqueIssueUUIDs(issueIDs []string) []pgtype.UUID
 ```
 
-For each parseable in-workspace ID, compute prospective title/description and
-run the same guard. Preserve existing skip semantics for malformed, missing,
-and cross-workspace IDs. Call the helper before `updated := 0` and before the
-mutation loop whenever the requested status is `in_review`.
+Canonicalize, deduplicate, and sort parseable IDs, then lock every in-workspace
+row with `GetIssueInWorkspaceForUpdate` in one transaction. Compute prospective
+title/description and run the same guard against all locked rows before the
+first mutation. Apply accepted updates in the same transaction, commit once,
+then emit events, dispatch runs, and notify parents. Preserve existing skip
+semantics for malformed, missing, and cross-workspace IDs and request-order
+count semantics for duplicates.
 
 - [ ] **Step 4: Verify GREEN and run the full handler package**
 
