@@ -3,14 +3,12 @@ package issueguard
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
-var (
-	hr37AssertionMarkerPattern = regexp.MustCompile(`(^|[^A-Za-z0-9_])(assert_[0-9]+)[[:space:]]*:`)
-	requiredHR37Fields         = []string{"evidence_cmd", "threshold", "observed"}
-)
+var requiredHR37Fields = []string{"evidence_cmd", "threshold", "observed"}
 
 // HR37Assertion contains one parsed hr37 assertion block.
 type HR37Assertion struct {
@@ -41,15 +39,12 @@ func ParseHR37Assertions(description string) HR37AssertionParseResult {
 	searchFrom := 0
 
 	for searchFrom < len(description) {
-		match := hr37AssertionMarkerPattern.FindStringSubmatchIndex(description[searchFrom:])
-		if match == nil {
+		name, markerEnd, found := findNextHR37Marker(description, searchFrom)
+		if !found {
 			break
 		}
 
 		result.HasMarkers = true
-		markerEnd := searchFrom + match[1]
-		name := description[searchFrom+match[4] : searchFrom+match[5]]
-
 		_, duplicate := seenMarkers[name]
 		seenMarkers[name] = struct{}{}
 
@@ -82,6 +77,49 @@ func ParseHR37Assertions(description string) HR37AssertionParseResult {
 	}
 
 	return result
+}
+
+func findNextHR37Marker(input string, start int) (string, int, bool) {
+	const prefix = "assert_"
+
+	for start < len(input) {
+		offset := strings.Index(input[start:], prefix)
+		if offset < 0 {
+			return "", 0, false
+		}
+
+		markerStart := start + offset
+		if markerStart > 0 && isHR37ASCIIWord(input[markerStart-1]) {
+			start = markerStart + len(prefix)
+			continue
+		}
+
+		digitsStart := markerStart + len(prefix)
+		digitsEnd := digitsStart
+		for digitsEnd < len(input) && input[digitsEnd] >= '0' && input[digitsEnd] <= '9' {
+			digitsEnd++
+		}
+		if digitsEnd == digitsStart {
+			start = digitsStart
+			continue
+		}
+
+		colon := skipHR37Whitespace(input, digitsEnd, len(input))
+		if colon < len(input) && input[colon] == ':' {
+			return input[markerStart:digitsEnd], colon + 1, true
+		}
+
+		start = digitsStart
+	}
+
+	return "", 0, false
+}
+
+func isHR37ASCIIWord(value byte) bool {
+	return value == '_' ||
+		value >= 'a' && value <= 'z' ||
+		value >= 'A' && value <= 'Z' ||
+		value >= '0' && value <= '9'
 }
 
 func findHR37MappingEnd(input string, start int) (int, bool) {
@@ -155,10 +193,14 @@ func parseHR37Mapping(name, mapping string) (HR37Assertion, error) {
 			return HR37Assertion{}, fmt.Errorf("%s: missing value for key %q", name, key)
 		}
 
-		var value string
+		var decodedValue any
 		decoder := json.NewDecoder(strings.NewReader(mapping[position:end]))
-		if err := decoder.Decode(&value); err != nil {
+		if err := decoder.Decode(&decodedValue); err != nil {
 			return HR37Assertion{}, fmt.Errorf("%s: key %q must contain a valid JSON string", name, key)
+		}
+		value, ok := decodedValue.(string)
+		if !ok {
+			return HR37Assertion{}, fmt.Errorf("%s: key %q must contain a JSON string", name, key)
 		}
 		position += int(decoder.InputOffset())
 		fields[key] = value
@@ -182,10 +224,10 @@ func parseHR37Mapping(name, mapping string) (HR37Assertion, error) {
 			return HR37Assertion{}, fmt.Errorf("%s: missing required key %q", name, key)
 		}
 	}
-	if strings.TrimSpace(fields["evidence_cmd"]) == "" {
+	if isBlankHR37Value(fields["evidence_cmd"]) {
 		return HR37Assertion{}, fmt.Errorf("%s: evidence_cmd must not be blank", name)
 	}
-	if strings.TrimSpace(fields["threshold"]) == "" {
+	if isBlankHR37Value(fields["threshold"]) {
 		return HR37Assertion{}, fmt.Errorf("%s: threshold must not be blank", name)
 	}
 
@@ -199,14 +241,32 @@ func parseHR37Mapping(name, mapping string) (HR37Assertion, error) {
 
 func skipHR37Whitespace(input string, start, end int) int {
 	for start < end {
-		switch input[start] {
-		case ' ', '\t', '\n', '\r':
-			start++
-		default:
+		value, size := utf8.DecodeRuneInString(input[start:end])
+		if value == utf8.RuneError && size == 1 {
 			return start
 		}
+		if !isHR37Whitespace(value) {
+			return start
+		}
+		start += size
 	}
 	return start
+}
+
+func isHR37Whitespace(value rune) bool {
+	return unicode.IsSpace(value) || value >= '\u001c' && value <= '\u001f'
+}
+
+func isBlankHR37Value(value string) bool {
+	if value == "" {
+		return true
+	}
+	for _, current := range value {
+		if !isHR37Whitespace(current) {
+			return false
+		}
+	}
+	return true
 }
 
 func isHR37KeyStart(value byte) bool {

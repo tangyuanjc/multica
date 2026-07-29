@@ -147,6 +147,48 @@ assert_1: {evidence_cmd: "go vet ./...", threshold: "exit 0", observed: "PASS"}`
 				},
 			},
 		},
+		{
+			name:           "optional Unicode whitespace before colon and body",
+			description:    "assert_7\u2003:\u00a0{evidence_cmd\u2009:\u2002\"go test ./...\", threshold: \"exit 0\", observed: \"PASS\"}",
+			wantValid:      true,
+			wantHasMarkers: true,
+			wantCount:      1,
+			wantAssertions: []HR37Assertion{
+				{
+					Name:            "assert_7",
+					EvidenceCommand: "go test ./...",
+					Threshold:       "exit 0",
+					Observed:        "PASS",
+				},
+			},
+		},
+		{
+			name:           "null observed is not a string",
+			description:    `assert_1: {evidence_cmd: "go test ./...", threshold: "exit 0", observed: null}`,
+			wantHasMarkers: true,
+			wantErrors:     true,
+		},
+		{
+			name:           "side-effecting-looking command remains inert data",
+			description:    `assert_1: {evidence_cmd: "if false; then touch hr37-parser-side-effect; fi", threshold: "exit 0", observed: "PASS"}`,
+			wantValid:      true,
+			wantHasMarkers: true,
+			wantCount:      1,
+			wantAssertions: []HR37Assertion{
+				{
+					Name:            "assert_1",
+					EvidenceCommand: "if false; then touch hr37-parser-side-effect; fi",
+					Threshold:       "exit 0",
+					Observed:        "PASS",
+				},
+			},
+		},
+		{
+			name:           "Python-only whitespace is blank",
+			description:    `assert_1: {evidence_cmd: "\u001c", threshold: "exit 0", observed: "PASS"}`,
+			wantHasMarkers: true,
+			wantErrors:     true,
+		},
 	}
 
 	for _, tt := range tests {
