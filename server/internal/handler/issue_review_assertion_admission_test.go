@@ -14,6 +14,7 @@ import (
 const (
 	completedReviewAssertionDescription = `assert_1: {evidence_cmd: "go test ./internal/handler", threshold: "exit status 0", observed: "exit status 0"}`
 	blankObservedAssertionDescription   = `assert_1: {evidence_cmd: "go test ./internal/handler", threshold: "exit status 0", observed: " \t"}`
+	invalidReviewAssertionDescription   = `assert_1: {evidence_cmd: "go test ./internal/handler", threshold: "exit status 0", observed: "exit status 0", sentinel_key: "must reject"}`
 )
 
 func reviewAssertionAdmissionTitle(label string) string {
@@ -47,6 +48,24 @@ func createReviewAssertionAdmissionIssue(
 		deleteTestIssue(t, issue.ID)
 	})
 	return issue
+}
+
+func decodeReviewAssertionAdmissionError(
+	t *testing.T,
+	w *httptest.ResponseRecorder,
+) string {
+	t.Helper()
+
+	var response struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode error response: %v; body=%s", err, w.Body.String())
+	}
+	if response.Error == "" {
+		t.Fatalf("error response contained an empty error field")
+	}
+	return response.Error
 }
 
 func TestReviewAssertionAdmissionCreateAllowsUnreviewedStatuses(t *testing.T) {
@@ -95,9 +114,13 @@ func TestReviewAssertionAdmissionCreateInitialReview(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("CreateIssue: expected 400, got %d: %s", w.Code, w.Body.String())
 		}
-		if !strings.Contains(w.Body.String(), "断言块") ||
-			!strings.Contains(w.Body.String(), "evidence_cmd") {
-			t.Fatalf("CreateIssue: expected actionable assertion policy message, got %s", w.Body.String())
+		message := decodeReviewAssertionAdmissionError(t, w)
+		if !strings.Contains(message, "断言块") ||
+			!strings.Contains(message, "evidence_cmd") {
+			t.Fatalf("CreateIssue: expected actionable assertion policy message, got %q", message)
+		}
+		if strings.HasPrefix(message, `issue "`) {
+			t.Fatalf("new-issue rejection unexpectedly included an identifier prefix: %q", message)
 		}
 
 		var count int
@@ -134,6 +157,14 @@ func TestReviewAssertionAdmissionUpdateRejectsMissingBlockWithoutMutation(t *tes
 	t.Cleanup(func() {
 		deleteTestIssue(t, id)
 	})
+	var issueNumber int32
+	if err := testPool.QueryRow(
+		context.Background(),
+		`SELECT number FROM issue WHERE id = $1`,
+		id,
+	).Scan(&issueNumber); err != nil {
+		t.Fatalf("load issue number: %v", err)
+	}
 
 	w := httptest.NewRecorder()
 	req := withURLParam(
@@ -148,9 +179,18 @@ func TestReviewAssertionAdmissionUpdateRejectsMissingBlockWithoutMutation(t *tes
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("UpdateIssue: expected 400, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "断言块") ||
-		!strings.Contains(w.Body.String(), "evidence_cmd") {
-		t.Fatalf("UpdateIssue: expected actionable assertion policy message, got %s", w.Body.String())
+	message := decodeReviewAssertionAdmissionError(t, w)
+	if !strings.Contains(message, "断言块") ||
+		!strings.Contains(message, "evidence_cmd") {
+		t.Fatalf("UpdateIssue: expected actionable assertion policy message, got %q", message)
+	}
+	wantIdentityPrefix := fmt.Sprintf(`issue "HAN-%d"：`, issueNumber)
+	if !strings.HasPrefix(message, wantIdentityPrefix) {
+		t.Fatalf(
+			"UpdateIssue error = %q, want derived identity prefix %q",
+			message,
+			wantIdentityPrefix,
+		)
 	}
 
 	var status string
@@ -240,6 +280,52 @@ func TestReviewAssertionAdmissionUpdateRejectsBlankObservedWithoutMutation(t *te
 	if status != "todo" || !descriptionIsNull {
 		t.Fatalf(
 			"rejected update mutated row: status=%q description_is_null=%v",
+			status,
+			descriptionIsNull,
+		)
+	}
+}
+
+func TestReviewAssertionAdmissionUpdateRejectsInvalidBlockWithoutMutation(t *testing.T) {
+	title := reviewAssertionAdmissionTitle("invalid syntax")
+	id := createTestIssue(t, title, "todo", "none")
+	t.Cleanup(func() {
+		deleteTestIssue(t, id)
+	})
+
+	w := httptest.NewRecorder()
+	req := withURLParam(
+		newRequest(http.MethodPut, "/api/issues/"+id, map[string]any{
+			"status":      "in_review",
+			"description": invalidReviewAssertionDescription,
+		}),
+		"id",
+		id,
+	)
+	testHandler.UpdateIssue(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("UpdateIssue: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	message := decodeReviewAssertionAdmissionError(t, w)
+	if !strings.Contains(message, "断言块") ||
+		!strings.Contains(message, "格式无效") {
+		t.Fatalf("UpdateIssue: expected invalid assertion policy message, got %q", message)
+	}
+
+	var status string
+	var descriptionIsNull bool
+	if err := testPool.QueryRow(
+		context.Background(),
+		`SELECT status, description IS NULL FROM issue WHERE id = $1`,
+		id,
+	).Scan(&status, &descriptionIsNull); err != nil {
+		t.Fatalf("reload rejected update: %v", err)
+	}
+	if status != "todo" || !descriptionIsNull {
+		t.Fatalf(
+			"rejected invalid block mutated row: status=%q description_is_null=%v",
 			status,
 			descriptionIsNull,
 		)
