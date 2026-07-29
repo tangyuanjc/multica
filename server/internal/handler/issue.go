@@ -2436,6 +2436,15 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if !validateIssueEnum(w, "status", status, validIssueStatuses) {
 		return
 	}
+	if status == "in_review" {
+		description := ""
+		if req.Description != nil {
+			description = *req.Description
+		}
+		if !admitNewIssueToReview(w, req.Title, description) {
+			return
+		}
+	}
 	if !validateIssueEnum(w, "priority", priority, validIssuePriorities) {
 		return
 	}
@@ -2750,6 +2759,28 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.Status != nil {
 		if !validateIssueEnum(w, "status", *req.Status, validIssueStatuses) {
 			return
+		}
+		if prevIssue.Status != "in_review" && *req.Status == "in_review" {
+			title := prevIssue.Title
+			if req.Title != nil {
+				title = *req.Title
+			}
+			description := ""
+			if prevIssue.Description.Valid {
+				description = prevIssue.Description.String
+			}
+			if req.Description != nil {
+				description = *req.Description
+			}
+			if !h.admitExistingIssueToReview(
+				w,
+				r,
+				prevIssue,
+				title,
+				description,
+			) {
+				return
+			}
 		}
 		params.Status = pgtype.Text{String: *req.Status, Valid: true}
 	}
