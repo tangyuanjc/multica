@@ -115,8 +115,8 @@ and a remediation hint naming the required fields.
 ## Error handling
 
 - Missing assertions: explain that an engineering issue needs an hr37 `断言块`.
-- Invalid syntax: explain that the block is invalid and include the first parser
-  reason without echoing command contents.
+- Invalid syntax: explain generically that the block is invalid and name the
+  required fields without echoing parser fragments or command contents.
 - Blank observations: explain that every `observed` must be filled before
   review.
 - Exempt and grandfathered issues pass without warnings or state changes.
