@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -76,6 +77,29 @@ type reviewAssertionAdmissionRaceTxStarter struct {
 	delegate   txStarter
 	inject     func(context.Context) error
 	beginCalls int
+}
+
+type reviewAssertionAdmissionCommitFailTx struct {
+	pgx.Tx
+}
+
+func (tx *reviewAssertionAdmissionCommitFailTx) Commit(ctx context.Context) error {
+	if err := tx.Tx.Rollback(ctx); err != nil {
+		return fmt.Errorf("rollback before injected commit failure: %w", err)
+	}
+	return errors.New("injected review assertion admission commit failure")
+}
+
+type reviewAssertionAdmissionCommitFailTxStarter struct {
+	delegate txStarter
+}
+
+func (s reviewAssertionAdmissionCommitFailTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.delegate.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &reviewAssertionAdmissionCommitFailTx{Tx: tx}, nil
 }
 
 func (s *reviewAssertionAdmissionRaceTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -652,5 +676,322 @@ func TestReviewAssertionAdmissionUpdateUsesLockedConnectionForValidation(t *test
 	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReviewAssertionAdmissionBatchRejectsAtomically(t *testing.T) {
+	compliant := createReviewAssertionAdmissionIssue(
+		t,
+		reviewAssertionAdmissionTitle("batch compliant"),
+		"todo",
+		completedReviewAssertionDescription,
+	)
+	missing := createReviewAssertionAdmissionIssue(
+		t,
+		reviewAssertionAdmissionTitle("batch missing"),
+		"todo",
+		"",
+	)
+
+	w := httptest.NewRecorder()
+	req := newRequest(http.MethodPost, "/api/issues/batch-update", map[string]any{
+		"issue_ids": []string{compliant.ID, missing.ID},
+		"updates": map[string]any{
+			"status": "in_review",
+		},
+	})
+	testHandler.BatchUpdateIssues(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("BatchUpdateIssues: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	message := decodeReviewAssertionAdmissionError(t, w)
+	if !strings.Contains(message, "断言块") ||
+		!strings.Contains(message, fmt.Sprintf("HAN-%d", missing.Number)) {
+		t.Fatalf("BatchUpdateIssues: expected issue-specific assertion rejection, got %q", message)
+	}
+
+	for _, issue := range []IssueResponse{compliant, missing} {
+		var status string
+		if err := testPool.QueryRow(
+			context.Background(),
+			`SELECT status FROM issue WHERE id = $1`,
+			issue.ID,
+		).Scan(&status); err != nil {
+			t.Fatalf("reload batch issue %s: %v", issue.ID, err)
+		}
+		if status != "todo" {
+			t.Fatalf("atomic batch rejection changed issue %s to %q", issue.ID, status)
+		}
+	}
+}
+
+func TestReviewAssertionAdmissionBatchUsesLockedCurrentRows(t *testing.T) {
+	first := createReviewAssertionAdmissionIssue(
+		t,
+		fmt.Sprintf("[日报] HR37 batch lock first %d", time.Now().UnixNano()),
+		"todo",
+		"",
+	)
+	second := createReviewAssertionAdmissionIssue(
+		t,
+		fmt.Sprintf("[日报] HR37 batch lock second %d", time.Now().UnixNano()),
+		"todo",
+		"",
+	)
+	engineeringTitle := reviewAssertionAdmissionTitle("batch locked current row")
+
+	originalTxStarter := testHandler.TxStarter
+	raceTxStarter := &reviewAssertionAdmissionRaceTxStarter{
+		delegate: originalTxStarter,
+		inject: func(ctx context.Context) error {
+			tag, err := testPool.Exec(ctx, `
+				UPDATE issue
+				SET title = $2,
+				    updated_at = now()
+				WHERE id = $1
+			`, second.ID, engineeringTitle)
+			if err != nil {
+				return fmt.Errorf("inject concurrent batch issue update: %w", err)
+			}
+			if tag.RowsAffected() != 1 {
+				return fmt.Errorf(
+					"inject concurrent batch issue update affected %d rows, want 1",
+					tag.RowsAffected(),
+				)
+			}
+			return nil
+		},
+	}
+	testHandler.TxStarter = raceTxStarter
+	t.Cleanup(func() {
+		testHandler.TxStarter = originalTxStarter
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest(http.MethodPost, "/api/issues/batch-update", map[string]any{
+		"issue_ids": []string{first.ID, second.ID},
+		"updates": map[string]any{
+			"status": "in_review",
+		},
+	})
+	testHandler.BatchUpdateIssues(w, req)
+
+	if raceTxStarter.beginCalls != 1 {
+		t.Fatalf(
+			"BatchUpdateIssues called Begin %d times, want exactly 1 guarded transaction",
+			raceTxStarter.beginCalls,
+		)
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("BatchUpdateIssues: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	for _, issue := range []IssueResponse{first, second} {
+		var status string
+		if err := testPool.QueryRow(
+			context.Background(),
+			`SELECT status FROM issue WHERE id = $1`,
+			issue.ID,
+		).Scan(&status); err != nil {
+			t.Fatalf("reload locked batch issue %s: %v", issue.ID, err)
+		}
+		if status != "todo" {
+			t.Fatalf("locked batch rejection changed issue %s to %q", issue.ID, status)
+		}
+	}
+}
+
+func TestReviewAssertionAdmissionBatchUsesProspectiveDescription(t *testing.T) {
+	first := createReviewAssertionAdmissionIssue(
+		t,
+		reviewAssertionAdmissionTitle("batch prospective first"),
+		"todo",
+		"",
+	)
+	second := createReviewAssertionAdmissionIssue(
+		t,
+		reviewAssertionAdmissionTitle("batch prospective second"),
+		"todo",
+		"",
+	)
+
+	w := httptest.NewRecorder()
+	req := newRequest(http.MethodPost, "/api/issues/batch-update", map[string]any{
+		"issue_ids": []string{first.ID, second.ID},
+		"updates": map[string]any{
+			"status":      "in_review",
+			"description": completedReviewAssertionDescription,
+		},
+	})
+	testHandler.BatchUpdateIssues(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("BatchUpdateIssues: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Updated int `json:"updated"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode batch response: %v", err)
+	}
+	if response.Updated != 2 {
+		t.Fatalf("updated = %d, want 2", response.Updated)
+	}
+
+	for _, issue := range []IssueResponse{first, second} {
+		var status string
+		var description string
+		if err := testPool.QueryRow(
+			context.Background(),
+			`SELECT status, description FROM issue WHERE id = $1`,
+			issue.ID,
+		).Scan(&status, &description); err != nil {
+			t.Fatalf("reload admitted batch issue %s: %v", issue.ID, err)
+		}
+		if status != "in_review" || description != completedReviewAssertionDescription {
+			t.Fatalf(
+				"batch issue %s = status %q description %q",
+				issue.ID,
+				status,
+				description,
+			)
+		}
+	}
+}
+
+func TestReviewAssertionAdmissionBatchPreservesSkippedIDs(t *testing.T) {
+	issue := createReviewAssertionAdmissionIssue(
+		t,
+		reviewAssertionAdmissionTitle("batch skipped ids"),
+		"todo",
+		completedReviewAssertionDescription,
+	)
+
+	w := httptest.NewRecorder()
+	req := newRequest(http.MethodPost, "/api/issues/batch-update", map[string]any{
+		"issue_ids": []string{
+			"not-a-uuid",
+			"00000000-0000-0000-0000-000000000001",
+			issue.ID,
+		},
+		"updates": map[string]any{
+			"status": "in_review",
+		},
+	})
+	testHandler.BatchUpdateIssues(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("BatchUpdateIssues: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Updated int `json:"updated"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode batch response: %v", err)
+	}
+	if response.Updated != 1 {
+		t.Fatalf("updated = %d, want 1", response.Updated)
+	}
+}
+
+func TestSortedUniqueIssueUUIDs(t *testing.T) {
+	got := sortedUniqueIssueUUIDs([]string{
+		"ffffffff-ffff-ffff-ffff-ffffffffffff",
+		"not-a-uuid",
+		"00000000-0000-0000-0000-000000000001",
+		"ffffffff-ffff-ffff-ffff-ffffffffffff",
+	})
+	want := []string{
+		"00000000-0000-0000-0000-000000000001",
+		"ffffffff-ffff-ffff-ffff-ffffffffffff",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("sortedUniqueIssueUUIDs() length = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if uuidToString(got[i]) != want[i] {
+			t.Fatalf("sortedUniqueIssueUUIDs()[%d] = %q, want %q", i, uuidToString(got[i]), want[i])
+		}
+	}
+}
+
+func TestReviewAssertionAdmissionBatchCommitFailureRollsBack(t *testing.T) {
+	issue := createReviewAssertionAdmissionIssue(
+		t,
+		reviewAssertionAdmissionTitle("batch commit failure"),
+		"todo",
+		completedReviewAssertionDescription,
+	)
+
+	handler := *testHandler
+	handler.TxStarter = reviewAssertionAdmissionCommitFailTxStarter{
+		delegate: testHandler.TxStarter,
+	}
+	w := httptest.NewRecorder()
+	req := newRequest(http.MethodPost, "/api/issues/batch-update", map[string]any{
+		"issue_ids": []string{issue.ID},
+		"updates": map[string]any{
+			"status": "in_review",
+		},
+	})
+	handler.BatchUpdateIssues(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("BatchUpdateIssues: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	var status string
+	if err := testPool.QueryRow(
+		context.Background(),
+		`SELECT status FROM issue WHERE id = $1`,
+		issue.ID,
+	).Scan(&status); err != nil {
+		t.Fatalf("reload commit-failed batch issue: %v", err)
+	}
+	if status != "todo" {
+		t.Fatalf("commit-failed batch persisted status %q, want todo", status)
+	}
+}
+
+func TestReviewAssertionAdmissionBatchUsesLockedConnectionForValidation(t *testing.T) {
+	issue := createReviewAssertionAdmissionIssue(
+		t,
+		reviewAssertionAdmissionTitle("batch single connection validation"),
+		"todo",
+		completedReviewAssertionDescription,
+	)
+
+	config := testPool.Config()
+	config.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("create one-connection pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatalf("ping one-connection pool: %v", err)
+	}
+
+	handler := *testHandler
+	handler.Queries = db.New(pool)
+	handler.TxStarter = pool
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	w := httptest.NewRecorder()
+	req := newRequest(http.MethodPost, "/api/issues/batch-update", map[string]any{
+		"issue_ids": []string{issue.ID},
+		"updates": map[string]any{
+			"status":        "in_review",
+			"assignee_type": "member",
+			"assignee_id":   testUserID,
+		},
+	}).WithContext(ctx)
+	handler.BatchUpdateIssues(w, req)
+
+	if ctx.Err() != nil {
+		t.Fatalf("guarded batch exhausted its context waiting for a second database connection: %v", ctx.Err())
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("BatchUpdateIssues: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 }

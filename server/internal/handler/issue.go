@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -3320,6 +3321,32 @@ type BatchUpdateIssuesRequest struct {
 	Updates  UpdateIssueRequest `json:"updates"`
 }
 
+type batchIssueUpdateEffect struct {
+	previous db.Issue
+	updated  db.Issue
+}
+
+func sortedUniqueIssueUUIDs(issueIDs []string) []pgtype.UUID {
+	seen := make(map[string]struct{}, len(issueIDs))
+	ids := make([]pgtype.UUID, 0, len(issueIDs))
+	for _, issueID := range issueIDs {
+		id, err := util.ParseUUID(issueID)
+		if err != nil {
+			continue
+		}
+		key := uuidToString(id)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return uuidToString(ids[i]) < uuidToString(ids[j])
+	})
+	return ids
+}
+
 func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -3392,22 +3419,169 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	_, batchTouchedType := rawUpdates["assignee_type"]
+	_, batchTouchedID := rawUpdates["assignee_id"]
+	guardedReviewBatch := req.Updates.Status != nil && *req.Updates.Status == "in_review"
+	queries := h.Queries
+	var reviewTx pgx.Tx
+	var lockedIssues map[string]db.Issue
+	var guardedEffects []batchIssueUpdateEffect
+	var issuePrefix string
+	var validationActorType string
+	var validationActorID string
+	var validationOriginatorID string
+	if guardedReviewBatch {
+		// Resolve pool-backed context before opening the transaction. Once the
+		// issue rows are locked every database read must use the transaction,
+		// otherwise a one-connection pool would deadlock waiting on itself.
+		issuePrefix = h.getIssuePrefix(r.Context(), wsUUID)
+		if batchTouchedType || batchTouchedID {
+			validationActorType, validationActorID = h.resolveActor(r, userID, workspaceID)
+			validationOriginatorID = h.invokeOriginatorFromRequest(r, validationActorType, validationActorID)
+		}
+
+		reviewTx, err = h.TxStarter.Begin(r.Context())
+		if err != nil {
+			slog.Warn("begin guarded batch issue update failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "failed to batch update issues")
+			return
+		}
+		defer reviewTx.Rollback(r.Context())
+		queries = h.Queries.WithTx(reviewTx)
+
+		// Concurrent batches can contain the same ids in opposite orders. Lock
+		// the canonical unique set in a stable order to avoid a lock-order
+		// deadlock, while retaining the original request order for update/count
+		// semantics below.
+		lockedIssues = make(map[string]db.Issue, len(req.IssueIDs))
+		for _, issueUUID := range sortedUniqueIssueUUIDs(req.IssueIDs) {
+			issue, lockErr := queries.GetIssueInWorkspaceForUpdate(r.Context(), db.GetIssueInWorkspaceForUpdateParams{
+				ID:          issueUUID,
+				WorkspaceID: wsUUID,
+			})
+			if errors.Is(lockErr, pgx.ErrNoRows) {
+				continue
+			}
+			if lockErr != nil {
+				slog.Warn("lock issue for guarded batch update failed", append(logger.RequestAttrs(r), "error", lockErr, "issue_id", uuidToString(issueUUID), "workspace_id", workspaceID)...)
+				writeError(w, http.StatusInternalServerError, "failed to batch update issues")
+				return
+			}
+			lockedIssues[uuidToString(issue.ID)] = issue
+		}
+
+		// Admission is a read-only pass over the locked snapshots. Do not apply
+		// the first UPDATE until every resolvable in-workspace target passes.
+		preflighted := make(map[string]struct{}, len(lockedIssues))
+		for _, issueID := range req.IssueIDs {
+			issueUUID, parseErr := util.ParseUUID(issueID)
+			if parseErr != nil {
+				continue
+			}
+			key := uuidToString(issueUUID)
+			if _, exists := preflighted[key]; exists {
+				continue
+			}
+			prevIssue, exists := lockedIssues[key]
+			if !exists {
+				continue
+			}
+			preflighted[key] = struct{}{}
+			if prevIssue.Status == "in_review" {
+				continue
+			}
+
+			title := prevIssue.Title
+			if req.Updates.Title != nil {
+				title = *req.Updates.Title
+			}
+			description := ""
+			if prevIssue.Description.Valid {
+				description = prevIssue.Description.String
+			}
+			if req.Updates.Description != nil {
+				description = *req.Updates.Description
+			}
+			identifier := ""
+			if issuePrefix != "" {
+				identifier = fmt.Sprintf("%s-%d", issuePrefix, prevIssue.Number)
+			}
+			if !h.admitExistingIssueToReview(w, prevIssue, identifier, title, description) {
+				return
+			}
+		}
+	}
+
 	updated := 0
 	// Children that transitioned into a terminal status this batch, collected so
 	// the parent/stage notification is evaluated once against the final state
 	// after the loop (MUL-4155) rather than per-child mid-batch.
 	var childDoneCompleted []db.Issue
+	emitUpdateEffects := func(prevIssue db.Issue, issue db.Issue) {
+		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
+		resp := issueToResponse(issue, prefix)
+		actorType, actorID := h.resolveActor(r, userID, workspaceID)
+
+		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&
+			(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
+		statusChanged := req.Updates.Status != nil && prevIssue.Status != issue.Status
+		priorityChanged := req.Updates.Priority != nil && prevIssue.Priority != issue.Priority
+		projectChanged := req.Updates.ProjectID != nil && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
+
+		h.publish(protocol.EventIssueUpdated, workspaceID, actorType, actorID, map[string]any{
+			"issue":            resp,
+			"assignee_changed": assigneeChanged,
+			"status_changed":   statusChanged,
+			"priority_changed": priorityChanged,
+			"project_changed":  projectChanged,
+		})
+
+		// Reassignment does not cancel existing tasks (#4963 / MUL-4113) —
+		// mirrors UpdateIssue. See that handler for the rationale.
+		//
+		// Same single predicate as UpdateIssue — batch must not grow its own
+		// copy of the enqueue rule (the historical source of four-entry-point
+		// drift, MUL-3375). suppress_run applies batch-wide.
+		if trigger, ok := h.IssueService.WillEnqueueRun(r.Context(),
+			service.IssueTriggerInput{
+				Issue:           issue,
+				PrevStatus:      prevIssue.Status,
+				AssigneeChanged: assigneeChanged,
+				StatusChanged:   statusChanged,
+			},
+			h.issueTriggerWriteProbe(r, actorType, issue),
+		); ok && !req.Updates.SuppressRun {
+			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote)
+		}
+
+		// Platform-driven parent notification is deferred until every effect
+		// has been collected so the final-state barrier runs only once.
+		if statusChanged && issue.ParentIssueID.Valid &&
+			!isTerminalChildStatus(prevIssue.Status) && isTerminalChildStatus(issue.Status) {
+			childDoneCompleted = append(childDoneCompleted, issue)
+		}
+	}
 	for _, issueID := range req.IssueIDs {
 		issueUUID, err := util.ParseUUID(issueID)
 		if err != nil {
 			continue
 		}
-		prevIssue, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
-			ID:          issueUUID,
-			WorkspaceID: wsUUID,
-		})
-		if err != nil {
-			continue
+		var prevIssue db.Issue
+		if guardedReviewBatch {
+			var exists bool
+			prevIssue, exists = lockedIssues[uuidToString(issueUUID)]
+			if !exists {
+				continue
+			}
+		} else {
+			prevIssue, err = queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+				ID:          issueUUID,
+				WorkspaceID: wsUUID,
+			})
+			if err != nil {
+				continue
+			}
 		}
 
 		params := db.UpdateIssueParams{
@@ -3488,7 +3662,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				// Validate parent exists in the same workspace.
-				if _, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+				if _, err := queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
 					ID:          newParentID,
 					WorkspaceID: prevIssue.WorkspaceID,
 				}); err != nil {
@@ -3498,7 +3672,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 				cycleDetected := false
 				cursor := newParentID
 				for depth := 0; depth < 10; depth++ {
-					ancestor, err := h.Queries.GetIssue(r.Context(), cursor)
+					ancestor, err := queries.GetIssue(r.Context(), cursor)
 					if err != nil || !ancestor.ParentIssueID.Valid {
 						break
 					}
@@ -3540,73 +3714,59 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 
 		// Validate the resulting assignee pair when this batch update touches
 		// either assignee field. Skip the issue silently on failure.
-		_, batchTouchedType := rawUpdates["assignee_type"]
-		_, batchTouchedID := rawUpdates["assignee_id"]
 		if batchTouchedType || batchTouchedID {
-			if status, _ := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID); status != 0 {
+			var status int
+			if guardedReviewBatch {
+				status, _ = h.validateAssigneePairWithQueries(
+					r.Context(),
+					queries,
+					workspaceID,
+					params.AssigneeType,
+					params.AssigneeID,
+					validationActorType,
+					validationActorID,
+					validationOriginatorID,
+				)
+			} else {
+				status, _ = h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID)
+			}
+			if status != 0 {
 				continue
 			}
 		}
 
-		issue, err := h.Queries.UpdateIssue(r.Context(), params)
+		issue, err := queries.UpdateIssue(r.Context(), params)
 		if err != nil {
 			slog.Warn("batch update issue failed", "issue_id", issueID, "error", err)
+			if guardedReviewBatch {
+				writeError(w, http.StatusInternalServerError, "failed to batch update issues")
+				return
+			}
 			continue
 		}
 
-		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-		resp := issueToResponse(issue, prefix)
-		actorType, actorID := h.resolveActor(r, userID, workspaceID)
-
-		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&
-			(prevIssue.AssigneeType.String != issue.AssigneeType.String || uuidToString(prevIssue.AssigneeID) != uuidToString(issue.AssigneeID))
-		statusChanged := req.Updates.Status != nil && prevIssue.Status != issue.Status
-		priorityChanged := req.Updates.Priority != nil && prevIssue.Priority != issue.Priority
-		projectChanged := req.Updates.ProjectID != nil && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
-
-		h.publish(protocol.EventIssueUpdated, workspaceID, actorType, actorID, map[string]any{
-			"issue":            resp,
-			"assignee_changed": assigneeChanged,
-			"status_changed":   statusChanged,
-			"priority_changed": priorityChanged,
-			"project_changed":  projectChanged,
-		})
-
-		// Reassignment does not cancel existing tasks (#4963 / MUL-4113) —
-		// mirrors UpdateIssue. See that handler for the rationale.
-		//
-		// Same single predicate as UpdateIssue — batch must not grow its own
-		// copy of the enqueue rule (the historical source of four-entry-point
-		// drift, MUL-3375). suppress_run applies batch-wide.
-		if trigger, ok := h.IssueService.WillEnqueueRun(r.Context(),
-			service.IssueTriggerInput{
-				Issue:           issue,
-				PrevStatus:      prevIssue.Status,
-				AssigneeChanged: assigneeChanged,
-				StatusChanged:   statusChanged,
-			},
-			h.issueTriggerWriteProbe(r, actorType, issue),
-		); ok && !req.Updates.SuppressRun {
-			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote)
-		}
-
-		// No status change — not even → cancelled — cancels active tasks here,
-		// mirroring UpdateIssue (MUL-4465). See that handler for the rationale.
-
-		// Platform-driven parent notification, mirrored from UpdateIssue
-		// (MUL-2538) but DEFERRED to after the loop. Evaluating the stage
-		// barrier here, per-child, would read a mid-batch sibling snapshot and
-		// fire a stale "advance Stage N+1" wake when one batch closes several
-		// stages at once (MUL-4155). Collect the terminal transitions and let
-		// notifyParentsOfBatchChildDone below evaluate each parent once against
-		// the batch's final committed state. Same transition guard as
-		// notifyParentOfChildDone: a non-terminal -> terminal move on a child.
-		if statusChanged && issue.ParentIssueID.Valid &&
-			!isTerminalChildStatus(prevIssue.Status) && isTerminalChildStatus(issue.Status) {
-			childDoneCompleted = append(childDoneCompleted, issue)
+		if guardedReviewBatch {
+			lockedIssues[uuidToString(issue.ID)] = issue
+			guardedEffects = append(guardedEffects, batchIssueUpdateEffect{
+				previous: prevIssue,
+				updated:  issue,
+			})
+		} else {
+			emitUpdateEffects(prevIssue, issue)
 		}
 
 		updated++
+	}
+
+	if reviewTx != nil {
+		if err := reviewTx.Commit(r.Context()); err != nil {
+			slog.Warn("commit guarded batch issue update failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "failed to batch update issues")
+			return
+		}
+		for _, effect := range guardedEffects {
+			emitUpdateEffects(effect.previous, effect.updated)
+		}
 	}
 
 	// Aggregate parent/stage notification over the whole batch's final state so
