@@ -1,6 +1,10 @@
 package issueguard
 
 import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -169,15 +173,15 @@ assert_1: {evidence_cmd: "go vet ./...", threshold: "exit 0", observed: "PASS"}`
 			wantErrors:     true,
 		},
 		{
-			name:           "side-effecting-looking command remains inert data",
-			description:    `assert_1: {evidence_cmd: "if false; then touch hr37-parser-side-effect; fi", threshold: "exit 0", observed: "PASS"}`,
+			name:           "escaped quotes and braces remain inside command",
+			description:    `assert_1: {evidence_cmd: "printf \"{still data}\"", threshold: "exit 0", observed: "PASS"}`,
 			wantValid:      true,
 			wantHasMarkers: true,
 			wantCount:      1,
 			wantAssertions: []HR37Assertion{
 				{
 					Name:            "assert_1",
-					EvidenceCommand: "if false; then touch hr37-parser-side-effect; fi",
+					EvidenceCommand: `printf "{still data}"`,
 					Threshold:       "exit 0",
 					Observed:        "PASS",
 				},
@@ -211,5 +215,31 @@ assert_1: {evidence_cmd: "go vet ./...", threshold: "exit 0", observed: "PASS"}`
 				t.Errorf("Assertions = %#v, want %#v", got.Assertions, tt.wantAssertions)
 			}
 		})
+	}
+}
+
+func TestReviewAssertionAdmissionParserTreatsEvidenceCommandAsData(t *testing.T) {
+	sentinelPath := filepath.Join(t.TempDir(), "evidence-command-was-executed")
+	evidenceCommand := "touch " + sentinelPath
+
+	encodedCommand, err := json.Marshal(evidenceCommand)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	description := `assert_1: {evidence_cmd: ` + string(encodedCommand) + `, threshold: "exit 0", observed: "PASS"}`
+
+	got := ParseHR37Assertions(description)
+
+	if !got.HasMarkers || !got.Valid() {
+		t.Fatalf("ParseHR37Assertions() = %#v, want valid assertion", got)
+	}
+	if len(got.Assertions) != 1 {
+		t.Fatalf("len(Assertions) = %d, want 1", len(got.Assertions))
+	}
+	if got.Assertions[0].EvidenceCommand != evidenceCommand {
+		t.Errorf("EvidenceCommand = %q, want %q", got.Assertions[0].EvidenceCommand, evidenceCommand)
+	}
+	if _, err := os.Stat(sentinelPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sentinel path was created or could not be checked: %v", err)
 	}
 }
