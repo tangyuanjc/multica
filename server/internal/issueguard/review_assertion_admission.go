@@ -4,11 +4,138 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
 
 var requiredHR37Fields = []string{"evidence_cmd", "threshold", "observed"}
+
+// HR37EnforcementStart is the first instant at which new issues must satisfy
+// the review assertion admission policy.
+var HR37EnforcementStart = time.Date(2026, time.July, 27, 21, 28, 17, 0, time.UTC)
+
+// ReviewAssertionAdmissionInput contains the issue fields used by the policy.
+type ReviewAssertionAdmissionInput struct {
+	Identifier  string
+	Title       string
+	Description string
+	CreatedAt   time.Time
+}
+
+// ReviewAssertionAdmissionReason identifies the policy branch that produced a result.
+type ReviewAssertionAdmissionReason string
+
+const (
+	ReviewAssertionAdmissionReasonAllowed               ReviewAssertionAdmissionReason = "allowed"
+	ReviewAssertionAdmissionReasonGrandfathered         ReviewAssertionAdmissionReason = "grandfathered"
+	ReviewAssertionAdmissionReasonExempt                ReviewAssertionAdmissionReason = "exempt"
+	ReviewAssertionAdmissionReasonMissingAssertionBlock ReviewAssertionAdmissionReason = "missing_assertion_block"
+	ReviewAssertionAdmissionReasonInvalidAssertionBlock ReviewAssertionAdmissionReason = "invalid_assertion_block"
+	ReviewAssertionAdmissionReasonObservedRequired      ReviewAssertionAdmissionReason = "observed_required"
+)
+
+// ReviewAssertionAdmissionResult contains the policy verdict and its audit reason.
+type ReviewAssertionAdmissionResult struct {
+	Allowed bool
+	Reason  ReviewAssertionAdmissionReason
+	Message string
+}
+
+// CheckReviewAssertionAdmission evaluates an issue without executing evidence commands.
+func CheckReviewAssertionAdmission(input ReviewAssertionAdmissionInput) ReviewAssertionAdmissionResult {
+	if !input.CreatedAt.IsZero() && input.CreatedAt.Before(HR37EnforcementStart) {
+		return ReviewAssertionAdmissionResult{
+			Allowed: true,
+			Reason:  ReviewAssertionAdmissionReasonGrandfathered,
+			Message: "该 issue 创建于 HR37 强制执行时间之前。",
+		}
+	}
+
+	if isReviewAssertionExemptTitle(input.Title) {
+		return ReviewAssertionAdmissionResult{
+			Allowed: true,
+			Reason:  ReviewAssertionAdmissionReasonExempt,
+			Message: "该 issue 符合固定的非工程豁免规则。",
+		}
+	}
+
+	parsed := ParseHR37Assertions(input.Description)
+	if !parsed.HasMarkers {
+		return ReviewAssertionAdmissionResult{
+			Reason:  ReviewAssertionAdmissionReasonMissingAssertionBlock,
+			Message: "缺少 HR37 断言块；请按 assert_N 内联映射格式补充 evidence_cmd、threshold 和 observed。",
+		}
+	}
+	if !parsed.Valid() {
+		message := "HR37 断言块格式无效；请修正语法，确保每项都包含字符串类型的 evidence_cmd、threshold 和 observed。"
+		if len(parsed.Errors) > 0 {
+			message += " 首个错误：" + parsed.Errors[0]
+		}
+		return ReviewAssertionAdmissionResult{
+			Reason:  ReviewAssertionAdmissionReasonInvalidAssertionBlock,
+			Message: message,
+		}
+	}
+
+	for _, assertion := range parsed.Assertions {
+		if isBlankHR37Value(assertion.Observed) {
+			return ReviewAssertionAdmissionResult{
+				Reason:  ReviewAssertionAdmissionReasonObservedRequired,
+				Message: "HR37 断言块的 observed 不能为空；请执行证据命令后填写实际观测结果。",
+			}
+		}
+	}
+
+	return ReviewAssertionAdmissionResult{
+		Allowed: true,
+		Reason:  ReviewAssertionAdmissionReasonAllowed,
+		Message: "HR37 断言块完整。",
+	}
+}
+
+func isReviewAssertionExemptTitle(title string) bool {
+	title = strings.TrimLeftFunc(title, isHR37Whitespace)
+
+	const knownUnbracketedPrefix = "🔍 Multica daily 扫描"
+	if len(title) >= len(knownUnbracketedPrefix) &&
+		strings.EqualFold(title[:len(knownUnbracketedPrefix)], knownUnbracketedPrefix) {
+		return true
+	}
+
+	var (
+		category string
+		found    bool
+	)
+	switch {
+	case strings.HasPrefix(title, "["):
+		category, _, found = strings.Cut(title[1:], "]")
+	case strings.HasPrefix(title, "【"):
+		category, _, found = strings.Cut(title[len("【"):], "】")
+	default:
+		return false
+	}
+	if !found {
+		return false
+	}
+
+	category = strings.ToLower(category)
+	for _, marker := range [...]string{
+		"日报",
+		"daily",
+		"巡检",
+		"日检",
+		"周检",
+		"patrol",
+		"公告",
+		"announcement",
+	} {
+		if strings.Contains(category, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // HR37Assertion contains one parsed hr37 assertion block.
 type HR37Assertion struct {
