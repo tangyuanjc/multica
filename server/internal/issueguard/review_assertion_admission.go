@@ -63,26 +63,31 @@ func CheckReviewAssertionAdmission(input ReviewAssertionAdmissionInput) ReviewAs
 	parsed := ParseHR37Assertions(input.Description)
 	if !parsed.HasMarkers {
 		return ReviewAssertionAdmissionResult{
-			Reason:  ReviewAssertionAdmissionReasonMissingAssertionBlock,
-			Message: "缺少 HR37 断言块；请按 assert_N 内联映射格式补充 evidence_cmd、threshold 和 observed。",
+			Reason: ReviewAssertionAdmissionReasonMissingAssertionBlock,
+			Message: reviewAssertionRejectionMessage(
+				input.Identifier,
+				"缺少 HR37 断言块；请按 assert_N 内联映射格式补充 evidence_cmd、threshold 和 observed。",
+			),
 		}
 	}
 	if !parsed.Valid() {
-		message := "HR37 断言块格式无效；请修正语法，确保每项都包含字符串类型的 evidence_cmd、threshold 和 observed。"
-		if len(parsed.Errors) > 0 {
-			message += " 首个错误：" + parsed.Errors[0]
-		}
 		return ReviewAssertionAdmissionResult{
-			Reason:  ReviewAssertionAdmissionReasonInvalidAssertionBlock,
-			Message: message,
+			Reason: ReviewAssertionAdmissionReasonInvalidAssertionBlock,
+			Message: reviewAssertionRejectionMessage(
+				input.Identifier,
+				"HR37 断言块格式无效；请修正语法，确保每项都包含字符串类型的 evidence_cmd、threshold 和 observed。",
+			),
 		}
 	}
 
 	for _, assertion := range parsed.Assertions {
 		if isBlankHR37Value(assertion.Observed) {
 			return ReviewAssertionAdmissionResult{
-				Reason:  ReviewAssertionAdmissionReasonObservedRequired,
-				Message: "HR37 断言块的 observed 不能为空；请执行证据命令后填写实际观测结果。",
+				Reason: ReviewAssertionAdmissionReasonObservedRequired,
+				Message: reviewAssertionRejectionMessage(
+					input.Identifier,
+					"HR37 断言块的 observed 不能为空；请执行证据命令后填写实际观测结果。",
+				),
 			}
 		}
 	}
@@ -92,6 +97,14 @@ func CheckReviewAssertionAdmission(input ReviewAssertionAdmissionInput) ReviewAs
 		Reason:  ReviewAssertionAdmissionReasonAllowed,
 		Message: "HR37 断言块完整。",
 	}
+}
+
+func reviewAssertionRejectionMessage(identifier, message string) string {
+	identifier = strings.TrimFunc(identifier, isHR37Whitespace)
+	if identifier == "" {
+		return message
+	}
+	return fmt.Sprintf("issue %q：%s", identifier, message)
 }
 
 func isReviewAssertionExemptTitle(title string) bool {
@@ -119,22 +132,35 @@ func isReviewAssertionExemptTitle(title string) bool {
 		return false
 	}
 
-	category = strings.ToLower(category)
-	for _, marker := range [...]string{
+	switch normalizeReviewAssertionExemptCategory(category) {
+	case "daily",
+		"work-daily",
 		"日报",
-		"daily",
+		"工作日报",
+		"日报状态票",
+		"日报可见性",
+		"loop radar daily",
+		"天猫投放监控日报",
 		"巡检",
 		"日检",
 		"周检",
 		"patrol",
 		"公告",
-		"announcement",
-	} {
-		if strings.Contains(category, marker) {
-			return true
-		}
+		"announcement":
+		return true
+	default:
+		return false
 	}
-	return false
+}
+
+func normalizeReviewAssertionExemptCategory(category string) string {
+	category = strings.TrimFunc(category, isHR37Whitespace)
+	return strings.Map(func(value rune) rune {
+		if value >= 'A' && value <= 'Z' {
+			return value + ('a' - 'A')
+		}
+		return value
+	}, category)
 }
 
 // HR37Assertion contains one parsed hr37 assertion block.

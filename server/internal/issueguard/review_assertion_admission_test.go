@@ -248,11 +248,15 @@ func TestReviewAssertionAdmissionParserTreatsEvidenceCommandAsData(t *testing.T)
 
 func TestReviewAssertionAdmissionPolicy(t *testing.T) {
 	const (
-		sentinelEvidenceCommand  = "printf DO_NOT_LEAK_HR37_EVIDENCE"
-		validDescription         = `assert_1: {evidence_cmd: "go test ./...", threshold: "exit 0", observed: "PASS"}`
-		missingDescription       = "Run " + sentinelEvidenceCommand + " before review."
-		invalidDescription       = `assert_1: {evidence_cmd: "` + sentinelEvidenceCommand + `", threshold: "exit 0", observed: "PASS",}`
-		blankObservedDescription = `assert_1: {evidence_cmd: "` + sentinelEvidenceCommand + `", threshold: "exit 0", observed: "\u001c\u2003"}`
+		sentinelEvidenceCommand       = "printf DO_NOT_LEAK_HR37_EVIDENCE"
+		sentinelDescriptionField      = "DO_NOT_LEAK_DESCRIPTION"
+		sentinelTitleFragment         = "DO_NOT_LEAK_TITLE"
+		validDescription              = `assert_1: {evidence_cmd: "go test ./...", threshold: "exit 0", observed: "PASS"}`
+		missingDescription            = "Run " + sentinelEvidenceCommand + " before review."
+		invalidDescription            = `assert_1: {evidence_cmd: "` + sentinelEvidenceCommand + `", threshold: "exit 0", observed: "PASS", ` + sentinelDescriptionField + `: "private"}`
+		blankObservedDescription      = `assert_1: {evidence_cmd: "` + sentinelEvidenceCommand + `", threshold: "exit 0", observed: "\u001c\u2003"}`
+		laterBlankObservedDescription = `assert_1: {evidence_cmd: "go test ./...", threshold: "exit 0", observed: "PASS"}
+assert_2: {evidence_cmd: "` + sentinelEvidenceCommand + `", threshold: "exit 0", observed: "\u001f"}`
 
 		reasonAllowed               ReviewAssertionAdmissionReason = "allowed"
 		reasonGrandfathered         ReviewAssertionAdmissionReason = "grandfathered"
@@ -279,7 +283,7 @@ func TestReviewAssertionAdmissionPolicy(t *testing.T) {
 	}{
 		{
 			name:       "missing assertion block",
-			input:      inputAt("[P1] Add admission policy", missingDescription, HR37EnforcementStart.Add(time.Nanosecond)),
+			input:      inputAt("[P1] "+sentinelTitleFragment, missingDescription, HR37EnforcementStart.Add(time.Nanosecond)),
 			wantReason: reasonMissingAssertionBlock,
 		},
 		{
@@ -291,6 +295,11 @@ func TestReviewAssertionAdmissionPolicy(t *testing.T) {
 		{
 			name:       "blank observed under Python whitespace semantics",
 			input:      inputAt("[P1] Add admission policy", blankObservedDescription, HR37EnforcementStart),
+			wantReason: reasonObservedRequired,
+		},
+		{
+			name:       "later assertion with blank observed is rejected",
+			input:      inputAt("[P1] Multiple assertions", laterBlankObservedDescription, HR37EnforcementStart),
 			wantReason: reasonObservedRequired,
 		},
 		{
@@ -321,8 +330,32 @@ func TestReviewAssertionAdmissionPolicy(t *testing.T) {
 			wantReason:  reasonExempt,
 		},
 		{
-			name:        "work daily category is exempt",
-			input:       inputAt("[work-daily] Status report", missingDescription, HR37EnforcementStart),
+			name:        "work daily category is trimmed and ASCII case insensitive",
+			input:       inputAt("[ \tWoRk-DaIlY\u2003] Status report", missingDescription, HR37EnforcementStart),
+			wantAllowed: true,
+			wantReason:  reasonExempt,
+		},
+		{
+			name:        "work report category is exempt",
+			input:       inputAt("【工作日报】状态报告", missingDescription, HR37EnforcementStart),
+			wantAllowed: true,
+			wantReason:  reasonExempt,
+		},
+		{
+			name:        "daily status ticket category is exempt",
+			input:       inputAt("[日报状态票] 状态报告", missingDescription, HR37EnforcementStart),
+			wantAllowed: true,
+			wantReason:  reasonExempt,
+		},
+		{
+			name:        "daily visibility category is exempt",
+			input:       inputAt("[日报可见性] 状态报告", missingDescription, HR37EnforcementStart),
+			wantAllowed: true,
+			wantReason:  reasonExempt,
+		},
+		{
+			name:        "Tmall monitoring daily category is exempt",
+			input:       inputAt("【天猫投放监控日报】状态报告", missingDescription, HR37EnforcementStart),
 			wantAllowed: true,
 			wantReason:  reasonExempt,
 		},
@@ -381,6 +414,16 @@ func TestReviewAssertionAdmissionPolicy(t *testing.T) {
 			wantReason:  reasonExempt,
 		},
 		{
+			name:       "daily near-match category is not exempt",
+			input:      inputAt("[not-daily-engineering] Fix generator", missingDescription, HR37EnforcementStart),
+			wantReason: reasonMissingAssertionBlock,
+		},
+		{
+			name:       "announcement near-match category is not exempt",
+			input:      inputAt("[announcement-fix] Fix announcements", missingDescription, HR37EnforcementStart),
+			wantReason: reasonMissingAssertionBlock,
+		},
+		{
 			name:       "daily marker in later prose does not exempt engineering work",
 			input:      inputAt("[P1] 修复日报生成器", missingDescription, HR37EnforcementStart),
 			wantReason: reasonMissingAssertionBlock,
@@ -415,9 +458,33 @@ func TestReviewAssertionAdmissionPolicy(t *testing.T) {
 				if strings.Contains(got.Message, sentinelEvidenceCommand) {
 					t.Errorf("rejection Message leaked evidence command: %q", got.Message)
 				}
+				if tt.input.Identifier != "" {
+					wantPrefix := `issue "` + tt.input.Identifier + `"：`
+					if !strings.HasPrefix(got.Message, wantPrefix) {
+						t.Errorf("rejection Message = %q, want prefix %q", got.Message, wantPrefix)
+					}
+				}
+				if strings.Contains(got.Message, sentinelDescriptionField) {
+					t.Errorf("rejection Message leaked description content: %q", got.Message)
+				}
+				if strings.Contains(got.Message, sentinelTitleFragment) {
+					t.Errorf("rejection Message leaked title content: %q", got.Message)
+				}
 			}
 		})
 	}
+
+	t.Run("empty identifier leaves a clean rejection message", func(t *testing.T) {
+		input := inputAt("[P1] Missing assertion", missingDescription, HR37EnforcementStart)
+		input.Identifier = ""
+
+		got := CheckReviewAssertionAdmission(input)
+
+		const wantMessage = "缺少 HR37 断言块；请按 assert_N 内联映射格式补充 evidence_cmd、threshold 和 observed。"
+		if got.Message != wantMessage {
+			t.Errorf("Message = %q, want %q", got.Message, wantMessage)
+		}
+	})
 
 	t.Run("evidence commands remain inert", func(t *testing.T) {
 		sentinelPath := filepath.Join(t.TempDir(), "admission-executed-command")
