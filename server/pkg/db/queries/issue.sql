@@ -80,6 +80,11 @@ WHERE workspace_id = sqlc.arg('workspace_id')
 SELECT * FROM issue
 WHERE id = $1 AND workspace_id = $2;
 
+-- name: GetIssueInWorkspaceForUpdate :one
+SELECT * FROM issue
+WHERE id = $1 AND workspace_id = $2
+FOR UPDATE;
+
 -- name: CreateIssue :one
 INSERT INTO issue (
     workspace_id, title, description, status, priority,

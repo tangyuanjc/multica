@@ -46,6 +46,10 @@ import (
 // agent/system principals, but member/team targets fail closed without a
 // matching human.
 func (h *Handler) canInvokeAgent(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
+	return h.canInvokeAgentWithQueries(ctx, h.Queries, agent, actorType, actorID, originatorUserID, workspaceID)
+}
+
+func (h *Handler) canInvokeAgentWithQueries(ctx context.Context, queries *db.Queries, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
 	effectiveUser := actorID
 	if actorType != "member" {
 		// agent / system: never trust the immediate principal, only the
@@ -64,7 +68,7 @@ func (h *Handler) canInvokeAgent(ctx context.Context, agent db.Agent, actorType,
 		return false
 	}
 
-	targets, err := h.Queries.ListAgentInvocationTargets(ctx, agent.ID)
+	targets, err := queries.ListAgentInvocationTargets(ctx, agent.ID)
 	if err != nil {
 		return false
 	}
@@ -82,7 +86,7 @@ func (h *Handler) canInvokeAgent(ctx context.Context, agent db.Agent, actorType,
 	workspaceBroad := actorType == "agent" || actorType == "system"
 	isWorkspaceMember := false
 	if effectiveUser != "" {
-		if _, err := h.getWorkspaceMember(ctx, effectiveUser, workspaceID); err == nil {
+		if _, err := getWorkspaceMemberWithQueries(ctx, queries, effectiveUser, workspaceID); err == nil {
 			isWorkspaceMember = true
 		}
 	}

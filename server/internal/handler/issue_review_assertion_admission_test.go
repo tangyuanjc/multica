@@ -9,6 +9,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 const (
@@ -66,6 +70,32 @@ func decodeReviewAssertionAdmissionError(
 		t.Fatalf("error response contained an empty error field")
 	}
 	return response.Error
+}
+
+type reviewAssertionAdmissionRaceTxStarter struct {
+	delegate   txStarter
+	inject     func(context.Context) error
+	beginCalls int
+}
+
+func (s *reviewAssertionAdmissionRaceTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	s.beginCalls++
+
+	tx, err := s.delegate.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	inject := s.inject
+	s.inject = nil
+	if inject != nil {
+		if err := inject(ctx); err != nil {
+			_ = tx.Rollback(ctx)
+			return nil, err
+		}
+	}
+
+	return tx, nil
 }
 
 func TestReviewAssertionAdmissionCreateAllowsUnreviewedStatuses(t *testing.T) {
@@ -495,5 +525,132 @@ func TestReviewAssertionAdmissionUpdateDoesNotRegateAlreadyInReview(t *testing.T
 	}
 	if status != "in_review" || title != newTitle {
 		t.Fatalf("re-sent review update not persisted: status=%q title=%q", status, title)
+	}
+}
+
+func TestReviewAssertionAdmissionUpdateLocksCurrentRowBeforeAdmission(t *testing.T) {
+	initialTitle := fmt.Sprintf(
+		"[日报] HR37 locked snapshot setup %d",
+		time.Now().UnixNano(),
+	)
+	engineeringTitle := reviewAssertionAdmissionTitle("locked snapshot race")
+	issue := createReviewAssertionAdmissionIssue(t, initialTitle, "in_review", "")
+
+	originalTxStarter := testHandler.TxStarter
+	raceTxStarter := &reviewAssertionAdmissionRaceTxStarter{
+		delegate: originalTxStarter,
+		inject: func(ctx context.Context) error {
+			tag, err := testPool.Exec(ctx, `
+				UPDATE issue
+				SET status = 'todo',
+				    title = $2,
+				    description = NULL,
+				    updated_at = now()
+				WHERE id = $1
+			`, issue.ID, engineeringTitle)
+			if err != nil {
+				return fmt.Errorf("inject concurrent issue update: %w", err)
+			}
+			if tag.RowsAffected() != 1 {
+				return fmt.Errorf(
+					"inject concurrent issue update affected %d rows, want 1",
+					tag.RowsAffected(),
+				)
+			}
+			return nil
+		},
+	}
+	testHandler.TxStarter = raceTxStarter
+	t.Cleanup(func() {
+		testHandler.TxStarter = originalTxStarter
+	})
+
+	w := httptest.NewRecorder()
+	req := withURLParam(
+		newRequest(http.MethodPut, "/api/issues/"+issue.ID, map[string]any{
+			"status": "in_review",
+		}),
+		"id",
+		issue.ID,
+	)
+	testHandler.UpdateIssue(w, req)
+
+	if raceTxStarter.beginCalls != 1 {
+		t.Fatalf(
+			"UpdateIssue called Begin %d times, want exactly 1 guarded transaction",
+			raceTxStarter.beginCalls,
+		)
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("UpdateIssue: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	message := decodeReviewAssertionAdmissionError(t, w)
+	if !strings.Contains(message, "断言块") {
+		t.Fatalf("expected assertion-block rejection, got %q", message)
+	}
+
+	var status string
+	var title string
+	var descriptionIsNull bool
+	if err := testPool.QueryRow(
+		context.Background(),
+		`SELECT status, title, description IS NULL FROM issue WHERE id = $1`,
+		issue.ID,
+	).Scan(&status, &title, &descriptionIsNull); err != nil {
+		t.Fatalf("reload concurrently changed issue: %v", err)
+	}
+	if status != "todo" || title != engineeringTitle || !descriptionIsNull {
+		t.Fatalf(
+			"guarded rejection overwrote concurrent state: status=%q title=%q description_is_null=%v",
+			status,
+			title,
+			descriptionIsNull,
+		)
+	}
+}
+
+func TestReviewAssertionAdmissionUpdateUsesLockedConnectionForValidation(t *testing.T) {
+	issue := createReviewAssertionAdmissionIssue(
+		t,
+		reviewAssertionAdmissionTitle("single connection validation"),
+		"todo",
+		completedReviewAssertionDescription,
+	)
+
+	config := testPool.Config()
+	config.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("create one-connection pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatalf("ping one-connection pool: %v", err)
+	}
+
+	handler := *testHandler
+	handler.Queries = db.New(pool)
+	handler.TxStarter = pool
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	w := httptest.NewRecorder()
+	req := withURLParam(
+		newRequest(http.MethodPut, "/api/issues/"+issue.ID, map[string]any{
+			"status":        "in_review",
+			"assignee_type": "member",
+			"assignee_id":   testUserID,
+		}).WithContext(ctx),
+		"id",
+		issue.ID,
+	)
+	handler.UpdateIssue(w, req)
+
+	if ctx.Err() != nil {
+		t.Fatalf("guarded update exhausted its context waiting for a second database connection: %v", ctx.Err())
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 }

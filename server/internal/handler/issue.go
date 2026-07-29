@@ -2737,6 +2737,57 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	var rawFields map[string]json.RawMessage
 	json.Unmarshal(bodyBytes, &rawFields)
 
+	if req.Status != nil && !validateIssueEnum(w, "status", *req.Status, validIssueStatuses) {
+		return
+	}
+	_, touchedType := rawFields["assignee_type"]
+	_, touchedID := rawFields["assignee_id"]
+
+	// A request that explicitly targets in_review must make its admission
+	// decision against the same row version it updates. The initial load above
+	// authenticates the caller and resolves identifier-style paths, but it is
+	// not a concurrency boundary: another writer can change the issue before
+	// this handler reaches UPDATE. Lock and reload the row so a stale request
+	// cannot bypass the review assertion gate.
+	queries := h.Queries
+	var reviewTx pgx.Tx
+	var reviewIdentifier string
+	var validationActorType string
+	var validationActorID string
+	var validationOriginatorID string
+	if req.Status != nil && *req.Status == "in_review" {
+		if prefix := h.getIssuePrefix(r.Context(), prevIssue.WorkspaceID); prefix != "" {
+			reviewIdentifier = fmt.Sprintf("%s-%d", prefix, prevIssue.Number)
+		}
+		if touchedType || touchedID {
+			validationActorType, validationActorID = h.resolveActor(r, userID, workspaceID)
+			validationOriginatorID = h.invokeOriginatorFromRequest(r, validationActorType, validationActorID)
+		}
+
+		reviewTx, err = h.TxStarter.Begin(r.Context())
+		if err != nil {
+			slog.Warn("begin guarded issue update failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "failed to update issue")
+			return
+		}
+		defer reviewTx.Rollback(r.Context())
+
+		queries = h.Queries.WithTx(reviewTx)
+		prevIssue, err = queries.GetIssueInWorkspaceForUpdate(r.Context(), db.GetIssueInWorkspaceForUpdateParams{
+			ID:          prevIssue.ID,
+			WorkspaceID: prevIssue.WorkspaceID,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "issue not found")
+				return
+			}
+			slog.Warn("lock issue for guarded update failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "failed to update issue")
+			return
+		}
+	}
+
 	// Pre-fill nullable fields (bare sqlc.narg) with current values
 	params := db.UpdateIssueParams{
 		ID:            prevIssue.ID,
@@ -2757,9 +2808,6 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		params.Description = pgtype.Text{String: *req.Description, Valid: true}
 	}
 	if req.Status != nil {
-		if !validateIssueEnum(w, "status", *req.Status, validIssueStatuses) {
-			return
-		}
 		if prevIssue.Status != "in_review" && *req.Status == "in_review" {
 			title := prevIssue.Title
 			if req.Title != nil {
@@ -2774,8 +2822,8 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 			}
 			if !h.admitExistingIssueToReview(
 				w,
-				r,
 				prevIssue,
+				reviewIdentifier,
 				title,
 				description,
 			) {
@@ -2850,7 +2898,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// Validate parent exists in the same workspace.
-			if _, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+			if _, err := queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
 				ID:          newParentID,
 				WorkspaceID: prevIssue.WorkspaceID,
 			}); err != nil {
@@ -2860,7 +2908,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 			// Cycle detection: walk up from the new parent to ensure we don't reach this issue.
 			cursor := newParentID
 			for depth := 0; depth < 10; depth++ {
-				ancestor, err := h.Queries.GetIssue(r.Context(), cursor)
+				ancestor, err := queries.GetIssue(r.Context(), cursor)
 				if err != nil || !ancestor.ParentIssueID.Valid {
 					break
 				}
@@ -2901,10 +2949,24 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// Validate the resulting (assignee_type, assignee_id) pair when the caller
 	// touches either field. Existing data on the issue is left alone if the
 	// caller is not changing it.
-	_, touchedType := rawFields["assignee_type"]
-	_, touchedID := rawFields["assignee_id"]
 	if touchedType || touchedID {
-		if status, msg := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID); status != 0 {
+		var status int
+		var msg string
+		if reviewTx != nil {
+			status, msg = h.validateAssigneePairWithQueries(
+				r.Context(),
+				queries,
+				workspaceID,
+				params.AssigneeType,
+				params.AssigneeID,
+				validationActorType,
+				validationActorID,
+				validationOriginatorID,
+			)
+		} else {
+			status, msg = h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID)
+		}
+		if status != 0 {
 			writeError(w, status, msg)
 			return
 		}
@@ -2915,11 +2977,18 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	issue, err := h.Queries.UpdateIssue(r.Context(), params)
+	issue, err := queries.UpdateIssue(r.Context(), params)
 	if err != nil {
 		slog.Warn("update issue failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to update issue: "+err.Error())
 		return
+	}
+	if reviewTx != nil {
+		if err := reviewTx.Commit(r.Context()); err != nil {
+			slog.Warn("commit guarded issue update failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "failed to update issue")
+			return
+		}
 	}
 
 	if len(attachmentIDs) > 0 {
@@ -3025,6 +3094,29 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 // callers should treat any non-zero status as a rejection and surface it back
 // to the client.
 func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, workspaceID string, assigneeType pgtype.Text, assigneeID pgtype.UUID) (int, string) {
+	actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
+	return h.validateAssigneePairWithQueries(
+		ctx,
+		h.Queries,
+		workspaceID,
+		assigneeType,
+		assigneeID,
+		actorType,
+		actorID,
+		h.invokeOriginatorFromRequest(r, actorType, actorID),
+	)
+}
+
+func (h *Handler) validateAssigneePairWithQueries(
+	ctx context.Context,
+	queries *db.Queries,
+	workspaceID string,
+	assigneeType pgtype.Text,
+	assigneeID pgtype.UUID,
+	actorType string,
+	actorID string,
+	originatorUserID string,
+) (int, string) {
 	// Both unset → unassigned issue, valid.
 	if !assigneeType.Valid && !assigneeID.Valid {
 		return 0, ""
@@ -3039,7 +3131,7 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 	}
 	switch assigneeType.String {
 	case "member":
-		if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+		if _, err := queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
 			UserID:      assigneeID,
 			WorkspaceID: wsUUID,
 		}); err != nil {
@@ -3047,7 +3139,7 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 		}
 		return 0, ""
 	case "agent":
-		agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		agent, err := queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
 			ID:          assigneeID,
 			WorkspaceID: wsUUID,
 		})
@@ -3057,13 +3149,12 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 		if agent.ArchivedAt.Valid {
 			return http.StatusBadRequest, "cannot assign to archived agent"
 		}
-		actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
-		if !h.canInvokeAgent(ctx, agent, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID) {
+		if !h.canInvokeAgentWithQueries(ctx, queries, agent, actorType, actorID, originatorUserID, workspaceID) {
 			return http.StatusForbidden, "cannot assign to private agent"
 		}
 		return 0, ""
 	case "squad":
-		squad, err := h.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
+		squad, err := queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
 			ID:          assigneeID,
 			WorkspaceID: wsUUID,
 		})
@@ -3073,12 +3164,11 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 		if squad.ArchivedAt.Valid {
 			return http.StatusBadRequest, "cannot assign to an archived squad"
 		}
-		leader, err := h.Queries.GetAgent(ctx, squad.LeaderID)
+		leader, err := queries.GetAgent(ctx, squad.LeaderID)
 		if err != nil || leader.ArchivedAt.Valid {
 			return http.StatusBadRequest, "squad leader is archived; cannot assign to this squad"
 		}
-		actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
-		if !h.canInvokeAgent(ctx, leader, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID) {
+		if !h.canInvokeAgentWithQueries(ctx, queries, leader, actorType, actorID, originatorUserID, workspaceID) {
 			return http.StatusForbidden, "cannot assign to squad with private leader"
 		}
 		return 0, ""

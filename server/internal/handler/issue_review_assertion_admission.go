@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"fmt"
 	"net/http"
 
 	"github.com/multica-ai/multica/server/internal/issueguard"
@@ -10,17 +9,13 @@ import (
 
 func (h *Handler) admitExistingIssueToReview(
 	w http.ResponseWriter,
-	r *http.Request,
 	issue db.Issue,
+	identifier string,
 	title string,
 	description string,
 ) bool {
 	result := issueguard.CheckReviewAssertionAdmission(issueguard.ReviewAssertionAdmissionInput{
-		Identifier: fmt.Sprintf(
-			"%s-%d",
-			h.getIssuePrefix(r.Context(), issue.WorkspaceID),
-			issue.Number,
-		),
+		Identifier:  identifier,
 		Title:       title,
 		Description: description,
 		CreatedAt:   issue.CreatedAt.Time,
