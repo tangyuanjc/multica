@@ -32,6 +32,16 @@ class LaunchdContractTest(unittest.TestCase):
 
         self.assertEqual(program_arguments[:2], ["/usr/bin/python3", "-E"])
 
+    def test_guard_uses_the_daemon_fork_before_the_global_cli(self) -> None:
+        plist_path = Path(__file__).with_name("com.multica.storage-guard.plist.example")
+        with plist_path.open("rb") as handle:
+            path_value = plistlib.load(handle)["EnvironmentVariables"]["PATH"]
+
+        self.assertEqual(
+            path_value.split(":")[:2],
+            ["__HOME__/.local/libexec/multica-fork", "__HOME__/.local/bin"],
+        )
+
 
 def base_config(root: Path) -> dict:
     return {
